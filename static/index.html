@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LogSentinel | 实时日志分析与告警平台</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="glass-bg"></div>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="logo">
+                <i class="fa-solid fa-shield-halved logo-icon"></i>
+                <span class="logo-text">LogSentinel</span>
+            </div>
+            
+            <div class="status-panel card">
+                <h3>系统状态</h3>
+                <div class="status-item">
+                    <span class="label">服务器连接:</span>
+                    <span id="ws-status" class="status-badge disconnected">
+                        <span class="pulse-dot"></span>
+                        <span class="text">断开</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="label">活动规则数:</span>
+                    <span id="rule-count" class="value">0</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">未解决告警:</span>
+                    <span id="alert-count" class="value-alert">0</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <a href="#dashboard" class="nav-item active"><i class="fa-solid fa-chart-line"></i> 控制面板</a>
+                <a href="#rules-manager" class="nav-item"><i class="fa-solid fa-triangle-exclamation"></i> 告警规则</a>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <p>LogSentinel v1.0.0</p>
+                <p>Status: Active Monitoring</p>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content" id="dashboard">
+            <header class="header">
+                <div class="header-title">
+                    <h1>分布式日志采集与告警看板</h1>
+                    <p class="subtitle">实时收集、有界背压、滑动窗口分析与异常告警引擎</p>
+                </div>
+                <div class="header-actions">
+                    <div id="eps-display" class="metric-glowing">
+                        <span class="metric-label">实时吞吐 (EPS)</span>
+                        <span id="eps-value" class="metric-val">0</span>
+                    </div>
+                </div>
+            </header>
+
+            <div class="grid-layout">
+                <!-- Real-time Chart Section -->
+                <div class="chart-section card">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-wave-square header-icon"></i> 实时日志吞吐趋势 (Events/Sec)</h2>
+                        <span class="card-subtitle">每秒接收并处理的日志数 (最近60秒)</span>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="epsChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Alert History Section -->
+                <div class="alert-section card">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-bell-exclamation header-icon alarm-pulsing"></i> 实时异常告警事件</h2>
+                        <span class="card-subtitle">滑动窗口规则触发告警列表</span>
+                    </div>
+                    <div class="alerts-wrapper" id="alerts-list">
+                        <!-- Dynamic Alert Cards go here -->
+                        <div class="no-alerts">
+                            <i class="fa-solid fa-circle-check"></i>
+                            <p>暂无活跃告警，系统运行平稳</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Log Stream Console Section -->
+                <div class="console-section card">
+                    <div class="card-header console-header">
+                        <div class="header-left">
+                            <h2><i class="fa-solid fa-terminal header-icon"></i> 日志数据流实时控制台</h2>
+                            <span class="card-subtitle">实时汇聚上报日志流 (滚动保存最近 100 条)</span>
+                        </div>
+                        <div class="console-controls">
+                            <div class="search-box">
+                                <i class="fa-solid fa-magnifying-glass"></i>
+                                <input type="text" id="log-search" placeholder="过滤关键字 / 级别...">
+                            </div>
+                            <label class="switch-container">
+                                <input type="checkbox" id="auto-scroll" checked>
+                                <span class="slider"></span>
+                                <span class="switch-label">自动滚动</span>
+                            </label>
+                            <button id="clear-console" class="btn-secondary"><i class="fa-solid fa-trash-can"></i> 清理</button>
+                        </div>
+                    </div>
+                    
+                    <div class="console-wrapper">
+                        <div class="console-body" id="console-output">
+                            <!-- Dynamic log rows -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Divider -->
+                <div class="section-divider"></div>
+
+                <!-- Rules Configurator Section -->
+                <div class="rules-section card" id="rules-manager">
+                    <div class="card-header">
+                        <h2><i class="fa-solid fa-gears header-icon"></i> 告警规则配置管理器</h2>
+                        <span class="card-subtitle">自定义滑动窗口下的阈值判断与过滤拦截</span>
+                    </div>
+                    
+                    <div class="rules-grid">
+                        <div class="rules-list-container">
+                            <h3>已加载规则表</h3>
+                            <div class="rules-list" id="rules-list">
+                                <!-- Dynamic rules -->
+                            </div>
+                        </div>
+
+                        <div class="rule-form-container">
+                            <h3>新建告警规则</h3>
+                            <form id="rule-form">
+                                <div class="form-group">
+                                    <label for="rule-name">规则名称</label>
+                                    <input type="text" id="rule-name" placeholder="例如: 频繁报错告警" required>
+                                </div>
+                                <div class="form-group-row">
+                                    <div class="form-group">
+                                        <label for="rule-type">条件类型</label>
+                                        <select id="rule-type" required>
+                                            <option value="count">计数阈值 (Count)</option>
+                                            <option value="keyword">关键字匹配 (Keyword)</option>
+                                            <option value="cpu_threshold">CPU 阈值 (%)</option>
+                                            <option value="ram_threshold">内存 阈值 (MB)</option>
+                                            <option value="agent_offline">采集端离线超时 (秒)</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="rule-window">滑动窗口 (秒)</label>
+                                        <input type="number" id="rule-window" min="1" max="60" value="10" required>
+                                    </div>
+                                </div>
+                                <div class="form-group-row">
+                                    <div class="form-group">
+                                        <label for="rule-threshold">触发阈值 (次)</label>
+                                        <input type="number" id="rule-threshold" min="1" value="5" required>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="rule-level">级别过滤</label>
+                                        <select id="rule-level">
+                                            <option value="">全部级别</option>
+                                            <option value="INFO">INFO</option>
+                                            <option value="WARN">WARN</option>
+                                            <option value="ERROR">ERROR</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label for="rule-keyword">匹配关键字</label>
+                                    <input type="text" id="rule-keyword" placeholder="例如: Connection timeout (可选)">
+                                </div>
+                                <button type="submit" class="btn-primary"><i class="fa-solid fa-plus"></i> 添加并启用规则</button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <!-- Webhook routing config section -->
+                    <div class="webhook-config-container">
+                        <h3><i class="fa-solid fa-bell"></i> 实时告警通道路由 (Feishu / DingTalk)</h3>
+                        <div class="webhook-card">
+                            <div class="form-group">
+                                <label for="webhook-url">群机器人 Webhook 地址</label>
+                                <div class="webhook-input-row">
+                                    <input type="text" id="webhook-url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/... 或 https://oapi.dingtalk.com/robot/send?...">
+                                    <button id="btn-save-webhook" class="btn-primary"><i class="fa-solid fa-floppy-disk"></i> 保存配置</button>
+                                    <button id="btn-test-webhook" class="btn-secondary"><i class="fa-solid fa-paper-plane"></i> 测试推送</button>
+                                </div>
+                                <span id="webhook-status" class="webhook-status-msg"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
