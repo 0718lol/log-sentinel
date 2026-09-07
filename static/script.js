@@ -179,10 +179,10 @@ function appendLogRow(log) {
     } catch (_) {}
 
     row.innerHTML = `
-        <span class="log-time">${timeStr}</span>
-        <span class="log-source">[${log.source}]</span>
-        <span class="${badgeClass}">${log.level}</span>
-        <span class="${textClass}">${escapeHTML(log.message)}</span>
+        <span class="log-time">${escapeHTML(timeStr)}</span>
+        <span class="log-source">[${escapeHTML(log.source)}]</span>
+        <span class="${escapeHTML(badgeClass)}">${escapeHTML(log.level)}</span>
+        <span class="${escapeHTML(textClass)}">${escapeHTML(log.message)}</span>
     `;
 
     // Apply active filter instantly
@@ -254,7 +254,7 @@ function addAlertCard(alert, isNew = false) {
         <div class="alert-content">
             <div class="alert-header-row">
                 <span class="alert-title"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHTML(alert.rule_name)}</span>
-                <span class="alert-time">${localTime}</span>
+                <span class="alert-time">${escapeHTML(localTime)}</span>
             </div>
             <p class="alert-desc">${escapeHTML(alert.message)}</p>
         </div>
@@ -356,10 +356,10 @@ async function fetchRules() {
                 metaHtml += `<span><i class="fa-solid fa-clock"></i> 窗口: ${rule.window_seconds}s</span>`;
                 metaHtml += `<span><i class="fa-solid fa-arrow-up-9-1"></i> 频次: &ge;${rule.threshold}次</span>`;
                 if (rule.level_filter) {
-                    metaHtml += `<span><i class="fa-solid fa-filter"></i> 级别: ${rule.level_filter}</span>`;
+                    metaHtml += `<span><i class="fa-solid fa-filter"></i> 级别: ${escapeHTML(rule.level_filter)}</span>`;
                 }
             } else if (rule.condition_type === "keyword") {
-                metaHtml += `<span><i class="fa-solid fa-key"></i> 关键字: "${rule.keyword_filter}"</span>`;
+                metaHtml += `<span><i class="fa-solid fa-key"></i> 关键字: "${escapeHTML(rule.keyword_filter)}"</span>`;
                 metaHtml += `<span><i class="fa-solid fa-clock"></i> 窗口: ${rule.window_seconds}s</span>`;
             } else if (rule.condition_type === "cpu_threshold") {
                 metaHtml += `<span><i class="fa-solid fa-microchip"></i> CPU &ge; ${rule.threshold}%</span>`;
