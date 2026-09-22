@@ -4,9 +4,14 @@ import sys
 import time
 import argparse
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 import psutil
+
+
+def utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string with Z suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 # Level parser helper
 def detect_level(message: str) -> str:
@@ -19,13 +24,16 @@ def detect_level(message: str) -> str:
         return "INFO"
 
 class LogAgent:
-    def __init__(self, filepath: str, server_url: str, source: str, batch_size: int, batch_interval: float):
+    def __init__(self, filepath: str, server_url: str, source: str, batch_size: int, batch_interval: float, token: str = ""):
         self.filepath = os.path.abspath(filepath)
         self.ingest_url = f"{server_url.rstrip('/')}/api/logs/ingest"
         self.source = source
         self.batch_size = batch_size
         self.batch_interval = batch_interval
-        
+
+        # Sent with every request when the server enables LOG_SENTINEL_TOKEN auth
+        self.headers = {"X-API-Token": token} if token else {}
+
         self.queue = None
         self.client = httpx.AsyncClient(trust_env=False)
         self.running = False
@@ -44,15 +52,13 @@ class LogAgent:
         self.batcher_task = asyncio.create_task(self.batch_and_send())
         self.stats_task = asyncio.create_task(self.report_agent_metrics())
 
-        await asyncio.gather(self.tailer_task, self.batcher_task, self.stats_task)
-
-    async def stop(self):
-        self.running = False
-        self.tailer_task.cancel()
-        self.batcher_task.cancel()
-        self.stats_task.cancel()
-        await self.client.aclose()
-        print("[*] Log Agent stopped.")
+        try:
+            await asyncio.gather(self.tailer_task, self.batcher_task, self.stats_task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.client.aclose()
+            print("[*] Log Agent stopped.")
 
     async def tail_file(self):
         """Tails the target file asynchronously, pushing lines to the bounded queue."""
@@ -138,12 +144,12 @@ class LogAgent:
                 await asyncio.sleep(1.0)
 
     async def send_batch_with_retry(self, log_lines):
-        """Sends a log batch to the server. Retries on failure using exponential backoff."""
+        """Sends a log batch to the server. Retries transient failures with exponential backoff."""
         # Convert lines to ingest payloads
         payload = []
         for line in log_lines:
             payload.append({
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": utc_now_iso(),
                 "level": detect_level(line),
                 "message": line,
                 "source": self.source
@@ -155,11 +161,16 @@ class LogAgent:
 
         while self.running:
             try:
-                response = await self.client.post(self.ingest_url, json=payload, timeout=5.0)
+                response = await self.client.post(self.ingest_url, json=payload, timeout=5.0, headers=self.headers)
                 if response.status_code == 200:
                     # Ingestion successful
                     if attempt > 0:
                         print(f"[*] Ingestion recovered after {attempt} retries.")
+                    return
+                elif 400 <= response.status_code < 500 and response.status_code != 429:
+                    # Client errors are permanent for this batch (bad payload, auth, ...).
+                    # Retrying would never succeed and would stall the queue forever.
+                    print(f"[!] Server rejected batch with HTTP {response.status_code}. Dropping {len(log_lines)} log lines.", file=sys.stderr)
                     return
                 elif response.status_code == 429:
                     # Server is rate limiting (Backpressure triggered by server)
@@ -202,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", default="mac-local-agent", help="Source metadata identifier")
     parser.add_argument("--batch-size", type=int, default=50, help="Max batch size before sending")
     parser.add_argument("--batch-interval", type=float, default=0.5, help="Batch send timeout interval (seconds)")
+    parser.add_argument("--token", default=os.environ.get("LOG_SENTINEL_TOKEN", ""), help="API token if the server enables auth (or set LOG_SENTINEL_TOKEN)")
     args = parser.parse_args()
 
     agent = LogAgent(
@@ -209,11 +221,13 @@ if __name__ == "__main__":
         server_url=args.server,
         source=args.source,
         batch_size=args.batch_size,
-        batch_interval=args.batch_interval
+        batch_interval=args.batch_interval,
+        token=args.token
     )
 
+    # stop() is folded into start()'s finally block: cancelling from a fresh event
+    # loop here would touch tasks/sockets bound to the loop asyncio.run just closed.
     try:
         asyncio.run(agent.start())
     except KeyboardInterrupt:
         print("\n[i] Shutting down agent...")
-        asyncio.run(agent.stop())
