@@ -1,11 +1,11 @@
 import asyncio
 import os
-import json
 import logging
 import re
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -23,11 +23,31 @@ latest_metrics = {"cpu": 0.0, "ram": 0.0}
 # Track last active epoch timestamps of each agent node
 agent_last_seen = {}
 
+# Alert cooldown: minimum seconds between two alerts of the same rule, so a metric
+# flapping around its threshold cannot flood the alert channels (env-tunable).
+ALERT_COOLDOWN_SECONDS = float(os.environ.get("ALERT_COOLDOWN_SECONDS", "10"))
+
+# Shared secret guarding write endpoints; auth stays disabled when unset (local demo mode)
+API_TOKEN = os.environ.get("LOG_SENTINEL_TOKEN", "").strip()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("LogServer")
 
-app = FastAPI(title="Log Alert Server")
+
+def utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string with Z suffix (agent/dashboard compatible)."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    heartbeat_task = asyncio.create_task(check_agent_heartbeats())
+    yield
+    heartbeat_task.cancel()
+
+
+app = FastAPI(title="Log Alert Server", lifespan=lifespan)
 
 # Initialize database
 database.init_db()
@@ -66,10 +86,13 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Map to store last triggered alert timestamps to prevent spam (Alert Suppression)
-# Key: rule_id (int), Value: timestamp (float)
+# Map to store last triggered alert timestamps per rule for the cooldown mechanism
+# (Alert Suppression). Key: rule_id (int), Value: trigger epoch (float)
 last_alert_timestamps = {}
-ALERT_COOLDOWN_SECONDS = 10.0
+
+# Serializes rule evaluation so two concurrent ingest batches cannot both observe
+# "no active alert" and double-fire the same rule
+evaluation_lock = asyncio.Lock()
 
 # ----------------- Models -----------------
 class LogEntry(BaseModel):
@@ -88,15 +111,17 @@ class RuleCreate(BaseModel):
 
 # ----------------- Helper Functions -----------------
 def parse_iso_to_epoch(iso_str: str) -> float:
-    """Parse ISO timestamp string to epoch float."""
+    """Parse ISO timestamp string to epoch seconds. Naive strings are treated as UTC."""
     try:
-        # Strip trailing Z and parse
+        # fromisoformat() cannot read the trailing Z itself (Python < 3.11)
         if iso_str.endswith("Z"):
-            iso_str = iso_str[:-1]
+            iso_str = iso_str[:-1] + "+00:00"
         dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except Exception:
-        return datetime.utcnow().timestamp()
+        return datetime.now(timezone.utc).timestamp()
 
 async def clean_old_logs(now_epoch: float):
     """Remove logs older than 60 seconds from memory sliding window."""
@@ -107,98 +132,102 @@ async def clean_old_logs(now_epoch: float):
 
 async def evaluate_rules(now_epoch: float):
     """Evaluate all active alerting rules against the sliding window with state transitions (Auto-Resolve)."""
-    rules = database.get_rules()
+    rules = await asyncio.to_thread(database.get_rules)
     active_rules = [r for r in rules if r["is_active"] == 1 and r["condition_type"] != "agent_offline"]
-    
-    async with window_lock:
-        # Convert sliding window to a local list for fast querying
-        current_logs = list(sliding_window)
 
-    for rule in active_rules:
-        rule_id = rule["id"]
-        rule_name = rule["name"]
-        cond_type = rule["condition_type"]
-        window_sec = rule["window_seconds"]
-        threshold = rule["threshold"]
-        lvl_filter = rule["level_filter"]
-        kw_filter = rule["keyword_filter"]
+    async with evaluation_lock:
+        async with window_lock:
+            # Convert sliding window to a local list for fast querying
+            current_logs = list(sliding_window)
 
-        # Check if this rule currently has an active alert in the database
-        active_alert = database.get_active_alert_by_rule(rule_id)
+        for rule in active_rules:
+            rule_id = rule["id"]
+            rule_name = rule["name"]
+            cond_type = rule["condition_type"]
+            window_sec = rule["window_seconds"]
+            threshold = rule["threshold"]
+            lvl_filter = rule["level_filter"]
+            kw_filter = rule["keyword_filter"]
 
-        # Check if trigger condition is met
-        is_triggered = False
-        alert_msg = ""
+            # Check if this rule currently has an active alert in the database
+            active_alert = await asyncio.to_thread(database.get_active_alert_by_rule, rule_id)
 
-        if cond_type == "cpu_threshold":
-            current_cpu = latest_metrics["cpu"]
-            if current_cpu >= threshold:
-                is_triggered = True
-                alert_msg = f"Rule [{rule_name}] triggered. CPU load at {current_cpu:.1f}% (Threshold: {threshold}%)."
-        elif cond_type == "ram_threshold":
-            current_ram = latest_metrics["ram"]
-            if current_ram >= threshold:
-                is_triggered = True
-                alert_msg = f"Rule [{rule_name}] triggered. Memory usage at {current_ram:.1f}MB (Threshold: {threshold}MB)."
-        else:
-            # Traditional log window count or keyword checks
-            window_start = now_epoch - window_sec
-            matching_count = 0
-            for log in current_logs:
-                if log["epoch"] >= window_start:
-                    if lvl_filter and log["level"].upper() != lvl_filter.upper():
-                        continue
-                    if kw_filter and kw_filter.lower() not in log["message"].lower():
-                        continue
-                    matching_count += 1
-            
-            if matching_count >= threshold:
-                is_triggered = True
-                alert_msg = f"Rule [{rule_name}] triggered. Found {matching_count} matching logs in last {window_sec}s (Threshold: {threshold})."
+            # Check if trigger condition is met
+            is_triggered = False
+            alert_msg = ""
 
-        # State transition handling
-        if is_triggered:
-            # Transition: Normal -> Alerting (Only trigger if not already active)
-            if not active_alert:
-                alert_id = database.save_alert(rule_id, rule_name, alert_msg)
-                logger.warning(f"ALERT TRIGGERED: {alert_msg}")
+            if cond_type == "cpu_threshold":
+                current_cpu = latest_metrics["cpu"]
+                if current_cpu >= threshold:
+                    is_triggered = True
+                    alert_msg = f"Rule [{rule_name}] triggered. CPU load at {current_cpu:.1f}% (Threshold: {threshold}%)."
+            elif cond_type == "ram_threshold":
+                current_ram = latest_metrics["ram"]
+                if current_ram >= threshold:
+                    is_triggered = True
+                    alert_msg = f"Rule [{rule_name}] triggered. Memory usage at {current_ram:.1f}MB (Threshold: {threshold}MB)."
+            else:
+                # Traditional log window count or keyword checks
+                window_start = now_epoch - window_sec
+                matching_count = 0
+                for log in current_logs:
+                    if log["epoch"] >= window_start:
+                        if lvl_filter and log["level"].upper() != lvl_filter.upper():
+                            continue
+                        if kw_filter and kw_filter.lower() not in log["message"].lower():
+                            continue
+                        matching_count += 1
 
-                # Broadcast new alert
-                alert_payload = {
-                    "type": "alert",
-                    "data": {
-                        "id": alert_id,
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                        "rule_name": rule_name,
-                        "rule_id": rule_id,
-                        "message": alert_msg,
-                        "status": "active"
+                if matching_count >= threshold:
+                    is_triggered = True
+                    alert_msg = f"Rule [{rule_name}] triggered. Found {matching_count} matching logs in last {window_sec}s (Threshold: {threshold})."
+
+            # State transition handling
+            if is_triggered:
+                # Transition: Normal -> Alerting. Skip while an alert is already active
+                # (it would duplicate) or while the rule is inside its cooldown window
+                # (it would spam the channels when the condition flaps).
+                if not active_alert and now_epoch - last_alert_timestamps.get(rule_id, 0.0) >= ALERT_COOLDOWN_SECONDS:
+                    last_alert_timestamps[rule_id] = now_epoch
+                    alert_id = await asyncio.to_thread(database.save_alert, rule_id, rule_name, alert_msg)
+                    logger.warning(f"ALERT TRIGGERED: {alert_msg}")
+
+                    # Broadcast new alert
+                    alert_payload = {
+                        "type": "alert",
+                        "data": {
+                            "id": alert_id,
+                            "timestamp": utc_now_iso(),
+                            "rule_name": rule_name,
+                            "rule_id": rule_id,
+                            "message": alert_msg,
+                            "status": "active"
+                        }
                     }
-                }
-                await manager.broadcast(alert_payload)
-                asyncio.create_task(send_webhook_alert(rule_name, alert_msg))
-        else:
-            # Transition: Alerting -> Resolved (Auto-resolve if condition is cleared)
-            if active_alert:
-                database.resolve_alert_by_rule(rule_id)
-                logger.info(f"ALERT AUTO-RESOLVED: Rule [{rule_name}] is now normal.")
-                
-                recovery_msg = f"告警恢复: 规则 [{rule_name}] 的触发条件已恢复正常。"
-                # Broadcast recovery
-                resolve_payload = {
-                    "type": "alert_resolved",
-                    "data": {
-                        "rule_id": rule_id,
-                        "alert_id": active_alert["id"],
-                        "message": recovery_msg
+                    await manager.broadcast(alert_payload)
+                    asyncio.create_task(send_webhook_alert(rule_name, alert_msg))
+            else:
+                # Transition: Alerting -> Resolved (Auto-resolve if condition is cleared)
+                if active_alert:
+                    await asyncio.to_thread(database.resolve_alert_by_rule, rule_id)
+                    logger.info(f"ALERT AUTO-RESOLVED: Rule [{rule_name}] is now normal.")
+
+                    recovery_msg = f"告警恢复: 规则 [{rule_name}] 的触发条件已恢复正常。"
+                    # Broadcast recovery
+                    resolve_payload = {
+                        "type": "alert_resolved",
+                        "data": {
+                            "rule_id": rule_id,
+                            "alert_id": active_alert["id"],
+                            "message": recovery_msg
+                        }
                     }
-                }
-                await manager.broadcast(resolve_payload)
-                asyncio.create_task(send_webhook_alert(rule_name, recovery_msg))
+                    await manager.broadcast(resolve_payload)
+                    asyncio.create_task(send_webhook_alert(rule_name, recovery_msg))
 
 async def send_webhook_alert(rule_name: str, message: str):
     """Send Webhook alert dispatch dynamically supporting Feishu and DingTalk."""
-    webhook_url = database.get_setting("webhook_url")
+    webhook_url = await asyncio.to_thread(database.get_setting, "webhook_url")
     if not webhook_url:
         return
 
@@ -219,12 +248,12 @@ async def send_webhook_alert(rule_name: str, message: str):
                     },
                     "template": template_color
                 },
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"**监控规则**: {rule_name}\n**告警描述**: {message}\n**发生时间**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                    }
-                ]
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": f"**监控规则**: {rule_name}\n**告警描述**: {message}\n**发生时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                        }
+                    ]
             }
         }
     # Determine if DingTalk
@@ -233,7 +262,7 @@ async def send_webhook_alert(rule_name: str, message: str):
             "msgtype": "markdown",
             "markdown": {
                 "title": title,
-                "text": f"## {title}\n- **监控规则**: {rule_name}\n- **告警描述**: {message}\n- **发生时间**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                "text": f"## {title}\n- **监控规则**: {rule_name}\n- **告警描述**: {message}\n- **发生时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
             }
         }
     # Generic custom webhook fallback
@@ -255,13 +284,22 @@ async def send_webhook_alert(rule_name: str, message: str):
 
 # ----------------- Routes -----------------
 
-@app.post("/api/logs/ingest")
+async def require_token(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
+    """Optional shared-secret gate for write endpoints.
+
+    Enabled by setting the LOG_SENTINEL_TOKEN environment variable; when unset
+    the server runs in open local-demo mode.
+    """
+    if API_TOKEN and x_api_token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+@app.post("/api/logs/ingest", dependencies=[Depends(require_token)])
 async def ingest_logs(entries: List[LogEntry]):
     """Ingest logs from Agent, save to database, update sliding window, and broadcast."""
     if not entries:
         return {"status": "ok", "count": 0}
 
-    now_epoch = datetime.utcnow().timestamp()
+    now_epoch = datetime.now(timezone.utc).timestamp()
     db_entries = []
     ws_log_data = []
 
@@ -298,8 +336,8 @@ async def ingest_logs(entries: List[LogEntry]):
                 "source": entry.source
             })
 
-    # Save to SQLite database
-    database.save_logs(db_entries)
+    # Save to SQLite database (offloaded to a thread so the event loop never blocks on disk I/O)
+    await asyncio.to_thread(database.save_logs, db_entries)
 
     # Broadcast to Web UI via WebSockets
     await manager.broadcast({
@@ -308,13 +346,13 @@ async def ingest_logs(entries: List[LogEntry]):
     })
 
     # Check and Auto-Resolve Agent Node Offline Alert if it was previously offline
-    rules = database.get_rules()
+    rules = await asyncio.to_thread(database.get_rules)
     offline_rule = next((r for r in rules if r["condition_type"] == "agent_offline" and r["is_active"] == 1), None)
     if offline_rule:
         rule_id = offline_rule["id"]
-        active_offline_alert = database.get_active_agent_offline_alert(rule_id, source)
+        active_offline_alert = await asyncio.to_thread(database.get_active_agent_offline_alert, rule_id, source)
         if active_offline_alert:
-            database.resolve_agent_offline_alert(rule_id, source)
+            await asyncio.to_thread(database.resolve_agent_offline_alert, rule_id, source)
             logger.info(f"AGENT RECOVERED: Agent [{source}] is back online.")
             
             # Broadcast recovery
@@ -337,17 +375,18 @@ async def ingest_logs(entries: List[LogEntry]):
 @app.get("/api/logs")
 async def get_logs(limit: int = 100):
     """Retrieve historical logs from SQLite."""
-    return database.get_recent_logs(limit)
+    return await asyncio.to_thread(database.get_recent_logs, limit)
 
 @app.get("/api/rules")
 async def get_rules():
     """Retrieve all alerting rules."""
-    return database.get_rules()
+    return await asyncio.to_thread(database.get_rules)
 
-@app.post("/api/rules")
+@app.post("/api/rules", dependencies=[Depends(require_token)])
 async def create_rule(rule: RuleCreate):
     """Add a new alerting rule."""
-    success = database.add_rule(
+    success = await asyncio.to_thread(
+        database.add_rule,
         name=rule.name,
         condition_type=rule.condition_type,
         threshold=rule.threshold,
@@ -359,10 +398,10 @@ async def create_rule(rule: RuleCreate):
         raise HTTPException(status_code=400, detail="Rule name already exists")
     return {"status": "ok"}
 
-@app.delete("/api/rules/{rule_id}")
+@app.delete("/api/rules/{rule_id}", dependencies=[Depends(require_token)])
 async def delete_rule(rule_id: int):
     """Delete a rule."""
-    database.delete_rule(rule_id)
+    await asyncio.to_thread(database.delete_rule, rule_id)
     return {"status": "ok"}
 
 # Model for Webhook configuration request
@@ -371,15 +410,15 @@ class WebhookConfig(BaseModel):
 
 @app.get("/api/settings/webhook")
 async def get_webhook_setting():
-    url = database.get_setting("webhook_url")
+    url = await asyncio.to_thread(database.get_setting, "webhook_url")
     return {"webhook_url": url}
 
-@app.post("/api/settings/webhook")
+@app.post("/api/settings/webhook", dependencies=[Depends(require_token)])
 async def save_webhook_setting(req: WebhookConfig):
-    database.save_setting("webhook_url", req.webhook_url)
+    await asyncio.to_thread(database.save_setting, "webhook_url", req.webhook_url)
     return {"status": "ok"}
 
-@app.post("/api/settings/webhook/test")
+@app.post("/api/settings/webhook/test", dependencies=[Depends(require_token)])
 async def test_webhook_setting(req: WebhookConfig):
     url = req.webhook_url
     if not url:
@@ -400,12 +439,12 @@ async def test_webhook_setting(req: WebhookConfig):
                     },
                     "template": "blue"
                 },
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"**状态**: 连接正常\n**详情**: {message}\n**测试时间**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                    }
-                ]
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "content": f"**状态**: 连接正常\n**详情**: {message}\n**测试时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                            }
+                        ]
             }
         }
     elif "dingtalk" in url or "oapi.dingtalk.com" in url:
@@ -413,7 +452,7 @@ async def test_webhook_setting(req: WebhookConfig):
             "msgtype": "markdown",
             "markdown": {
                 "title": title,
-                "text": f"## {title}\n- **状态**: 连接正常\n- **详情**: {message}\n- **测试时间**: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                "text": f"## {title}\n- **状态**: 连接正常\n- **详情**: {message}\n- **测试时间**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
             }
         }
     else:
@@ -435,12 +474,12 @@ async def test_webhook_setting(req: WebhookConfig):
 @app.get("/api/alerts")
 async def get_alerts(limit: int = 50):
     """Get recent alerts."""
-    return database.get_recent_alerts(limit)
+    return await asyncio.to_thread(database.get_recent_alerts, limit)
 
-@app.post("/api/alerts/{alert_id}/dismiss")
+@app.post("/api/alerts/{alert_id}/dismiss", dependencies=[Depends(require_token)])
 async def dismiss_alert(alert_id: int):
     """Mark alert as dismissed."""
-    database.dismiss_alert(alert_id)
+    await asyncio.to_thread(database.dismiss_alert, alert_id)
     return {"status": "ok"}
 
 # WebSocket endpoint for real-time dashboard updates
@@ -477,8 +516,8 @@ async def check_agent_heartbeats():
     while True:
         await asyncio.sleep(5.0)
         try:
-            now = datetime.utcnow().timestamp()
-            rules = database.get_rules()
+            now = datetime.now(timezone.utc).timestamp()
+            rules = await asyncio.to_thread(database.get_rules)
             offline_rule = next((r for r in rules if r["condition_type"] == "agent_offline" and r["is_active"] == 1), None)
             if not offline_rule:
                 continue
@@ -490,10 +529,10 @@ async def check_agent_heartbeats():
             for source, last_seen in list(agent_last_seen.items()):
                 if now - last_seen > timeout:
                     # Agent Offline Detected!
-                    active_alert = database.get_active_agent_offline_alert(rule_id, source)
+                    active_alert = await asyncio.to_thread(database.get_active_agent_offline_alert, rule_id, source)
                     if not active_alert:
                         alert_msg = f"Agent [{source}] has not sent heartbeats for over {timeout}s (Last active: {datetime.fromtimestamp(last_seen).strftime('%H:%M:%S')})."
-                        alert_id = database.save_alert(rule_id, rule_name, alert_msg)
+                        alert_id = await asyncio.to_thread(database.save_alert, rule_id, rule_name, alert_msg, source=source)
                         logger.warning(f"ALERT TRIGGERED: {alert_msg}")
 
                         # Broadcast offline alert
@@ -501,7 +540,7 @@ async def check_agent_heartbeats():
                             "type": "alert",
                             "data": {
                                 "id": alert_id,
-                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "timestamp": utc_now_iso(),
                                 "rule_name": rule_name,
                                 "rule_id": rule_id,
                                 "message": alert_msg,
@@ -513,12 +552,7 @@ async def check_agent_heartbeats():
         except Exception as e:
             logger.error(f"Error in heartbeat checker loop: {e}")
 
-@app.on_event("startup")
-async def startup_event():
-    # Launch agent heartbeat checker in the background event loop
-    asyncio.create_task(check_agent_heartbeats())
-
 if __name__ == "__main__":
     import uvicorn
-    # Start FastAPI server on port 8001
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Start FastAPI server on port 8001 (override with the PORT environment variable)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8001")))
