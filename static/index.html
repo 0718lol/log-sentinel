@@ -202,6 +202,21 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- Access token config section (only needed when server enables auth) -->
+                    <div class="webhook-config-container">
+                        <h3><i class="fa-solid fa-key"></i> 访问令牌 (服务端安全设置)</h3>
+                        <div class="webhook-card">
+                            <div class="form-group">
+                                <label for="api-token">API Token</label>
+                                <div class="webhook-input-row">
+                                    <input type="password" id="api-token" placeholder="仅当服务端设置了 LOG_SENTINEL_TOKEN 时需要填写">
+                                    <button id="btn-save-token" class="btn-primary"><i class="fa-solid fa-floppy-disk"></i> 保存令牌</button>
+                                </div>
+                                <span id="token-status" class="webhook-status-msg"></span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </main>

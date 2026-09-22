@@ -24,6 +24,29 @@ const btnSaveWebhook = document.getElementById("btn-save-webhook");
 const btnTestWebhook = document.getElementById("btn-test-webhook");
 const webhookStatus = document.getElementById("webhook-status");
 
+// ----------------- API Token (optional server-side auth) -----------------
+// The server only enforces this when LOG_SENTINEL_TOKEN is configured there.
+function getApiHeaders(withJson = true) {
+    const headers = {};
+    if (withJson) headers["Content-Type"] = "application/json";
+    const token = localStorage.getItem("logsentinel_api_token");
+    if (token) headers["X-API-Token"] = token;
+    return headers;
+}
+
+function showTokenStatus(msg, type) {
+    const tokenStatus = document.getElementById("token-status");
+    if (!tokenStatus) return;
+    tokenStatus.innerText = msg;
+    tokenStatus.className = `webhook-status-msg ${type}`;
+    setTimeout(() => {
+        if (tokenStatus.innerText === msg) {
+            tokenStatus.innerText = "";
+            tokenStatus.className = "webhook-status-msg";
+        }
+    }, 5000);
+}
+
 // Initialize application
 document.addEventListener("DOMContentLoaded", () => {
     initChart();
@@ -49,6 +72,17 @@ document.addEventListener("DOMContentLoaded", () => {
     // Webhook actions
     btnSaveWebhook.addEventListener("click", saveWebhookConfig);
     btnTestWebhook.addEventListener("click", testWebhookConfig);
+
+    // API token actions
+    const tokenInput = document.getElementById("api-token");
+    const btnSaveToken = document.getElementById("btn-save-token");
+    if (tokenInput && btnSaveToken) {
+        tokenInput.value = localStorage.getItem("logsentinel_api_token") || "";
+        btnSaveToken.addEventListener("click", () => {
+            localStorage.setItem("logsentinel_api_token", tokenInput.value.trim());
+            showTokenStatus(tokenInput.value.trim() ? "令牌已保存到本地浏览器。" : "令牌已清除。", "success");
+        });
+    }
 
     // Navigation Active State Highlight & Smooth Scroll
     const navItems = document.querySelectorAll(".nav-menu .nav-item");
@@ -435,10 +469,10 @@ async function handleCreateRule(e) {
     try {
         const res = await fetch("/api/rules", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getApiHeaders(),
             body: JSON.stringify(payload)
         });
-        
+
         if (res.ok) {
             ruleForm.reset();
             // Default select adjustments
@@ -446,8 +480,8 @@ async function handleCreateRule(e) {
             document.getElementById("rule-threshold").value = 5;
             fetchRules();
         } else {
-            const err = await res.json();
-            alert(`创建失败: ${err.detail}`);
+            const err = await res.json().catch(() => ({}));
+            alert(`创建失败: ${err.detail || "HTTP " + res.status}`);
         }
     } catch (err) {
         console.error("Error creating rule:", err);
@@ -457,9 +491,11 @@ async function handleCreateRule(e) {
 async function deleteRule(id) {
     if (!confirm("确定要删除此告警规则吗？")) return;
     try {
-        const res = await fetch(`/api/rules/${id}`, { method: "DELETE" });
+        const res = await fetch(`/api/rules/${id}`, { method: "DELETE", headers: getApiHeaders(false) });
         if (res.ok) {
             fetchRules();
+        } else if (res.status === 401) {
+            alert("删除失败: 需要有效的访问令牌（见下方安全设置）");
         }
     } catch (err) {
         console.error("Error deleting rule:", err);
@@ -468,9 +504,11 @@ async function deleteRule(id) {
 
 async function dismissAlert(id) {
     try {
-        const res = await fetch(`/api/alerts/${id}/dismiss`, { method: "POST" });
+        const res = await fetch(`/api/alerts/${id}/dismiss`, { method: "POST", headers: getApiHeaders(false) });
         if (res.ok) {
             fetchAlerts();
+        } else if (res.status === 401) {
+            showTokenStatus("需要有效的访问令牌才能执行此操作。", "error");
         }
     } catch (err) {
         console.error("Error dismissing alert:", err);
@@ -580,11 +618,13 @@ async function saveWebhookConfig() {
     try {
         const res = await fetch("/api/settings/webhook", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getApiHeaders(),
             body: JSON.stringify({ webhook_url: url })
         });
         if (res.ok) {
             showWebhookStatus("配置保存成功！", "success");
+        } else if (res.status === 401) {
+            showWebhookStatus("保存失败: 需要有效的访问令牌。", "error");
         } else {
             showWebhookStatus("保存失败，请重试。", "error");
         }
@@ -603,12 +643,14 @@ async function testWebhookConfig() {
     try {
         const res = await fetch("/api/settings/webhook/test", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getApiHeaders(),
             body: JSON.stringify({ webhook_url: url })
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (res.ok) {
             showWebhookStatus("测试消息发送成功！请检查您的飞书/钉钉群组。", "success");
+        } else if (res.status === 401) {
+            showWebhookStatus("发送失败: 需要有效的访问令牌。", "error");
         } else {
             showWebhookStatus(`发送失败: ${data.detail || '未知错误'}`, "error");
         }
