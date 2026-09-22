@@ -1,7 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
-log_system.db
+log_system.db*
 app.log
 .DS_Store
 *.egg-info/

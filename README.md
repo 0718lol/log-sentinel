@@ -9,10 +9,11 @@
 ## 🚀 项目核心亮点 (写在简历上的加分项)
 
 - **有界队列背压机制 (Backpressure)**：Agent 采集端内部设计了有界环形缓冲区（Bounded Queue）。当服务器不可用、网络抖动或返回 HTTP 429 (Too Many Requests) 时，Agent 会自动降低或暂停日志读取速率，直至服务器恢复，物理性隔离并防范 Agent 内存溢出（OOM）。
-- **重试容灾设计 (Exponential Backoff with Jitter)**：网络异常时，Agent 使用带有随机抖动的指数退避算法进行重试，避免重试流量瞬间冲垮服务器（“惊群效应”）。
+- **重试容灾设计 (Exponential Backoff with Jitter)**：网络异常时，Agent 使用带有随机抖动的指数退避算法进行重试，避免重试流量瞬间冲垮服务器（“惊群效应”）；对 4xx 这类**不可恢复错误**则直接丢弃该批次并继续尾随，避免无效重试堵塞队列。
 - **滑动窗口告警引擎 (Sliding Window Engine)**：服务端基于内存双端队列设计了滑动窗口判定算法，支持按指定时间区间、特定级别或关键字进行流式频次判定（如：“10秒内出现超过5次 ERROR 则告警”）。
-- **告警风暴收敛 (Alert Suppression)**：系统对同一个告警规则实施冷却机制（Cooldown），在设定时间内避免发送重复告警，防止告警通道过载。
+- **告警风暴收敛 (Alert Suppression)**：系统对同一个告警规则实施冷却机制（Cooldown，默认 10 秒，可用 `ALERT_COOLDOWN_SECONDS` 调整），配合“触发→自动恢复”状态机，避免指标在阈值附近抖动时反复触发告警、冲垮告警通道。
 - **现代化极客风看板 (Glassmorphic Web Dashboard)**：前端使用 WebSocket 建立实时双向数据流通道，结合 Canvas 绘制动态 EPS（每秒事件数）曲线，并支持终端控制台过滤、限制最大渲染行数以保护浏览器内存。
+- **服务端可靠性工程**：所有 SQLite 读写通过 `asyncio.to_thread` 卸载到线程池执行（事件循环永不被磁盘 I/O 阻塞），数据库启用 WAL 模式并为高频查询建索引；规则评估使用异步锁串行化，杜绝并发双触发。
 
 ---
 
@@ -27,18 +28,19 @@
 ## 📂 项目结构
 
 ```
-creation/
-├── .venv/                  # Python 虚拟环境
-├── static/                 # 前端静态资源
-│   ├── index.html          # 可视化监控大屏
-│   ├── style.css           # 玻璃拟物暗黑风样式
-│   └── script.js           # WebSocket通信与图表更新逻辑
-├── requirements.txt        # 依赖列表
-├── database.py             # SQLite 初始化与 CRUD 逻辑
-├── server.py               # FastAPI 服务端与滑动窗口规则引擎
-├── agent.py                # 异步日志采集代理 (带背压与退避重试)
-├── generator.py            # 业务系统日志流模拟发生器
-└── README.md               # 项目使用说明书
+log-sentinel/
+├── static/                     # 前端静态资源
+│   ├── index.html              # 可视化监控大屏
+│   ├── style.css               # 玻璃拟物暗黑风样式
+│   └── script.js               # WebSocket通信与图表更新逻辑
+├── scripts/
+│   └── verify_core_fixes.py    # 核心机制端到端回归测试 (20 项断言)
+├── requirements.txt            # 依赖列表
+├── database.py                 # SQLite 初始化、迁移与 CRUD 逻辑 (WAL 模式)
+├── server.py                   # FastAPI 服务端与滑动窗口规则引擎
+├── agent.py                    # 异步日志采集代理 (带背压、退避重试与 4xx 丢批)
+├── generator.py                # 业务系统日志流模拟发生器
+└── README.md                   # 项目使用说明书
 ```
 
 ---
@@ -48,24 +50,27 @@ creation/
 为了方便地在本地查看完整数据流和容灾效果，请按以下步骤开启多个终端运行：
 
 ### 1. 初始化依赖环境
-在 `creation` 根目录下，激活虚拟环境并安装依赖：
+在项目根目录下创建虚拟环境并安装依赖：
 ```bash
 # 1. 进入项目根目录
-cd "/Users/wanganchang/creation"
+cd log-sentinel
 
-# 2. 激活虚拟环境
-source .venv/bin/activate
+# 2. 创建并激活虚拟环境 (已有 .venv 可直接激活)
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 # 3. 安装依赖包
 pip install -r requirements.txt
 ```
 
 ### 2. 启动核心日志服务器 (Server)
-服务器将监听 `8001` 端口，初始化 SQLite 数据库：
+服务器默认监听 `8001` 端口（可用环境变量 `PORT` 覆盖），自动初始化 SQLite 数据库：
 ```bash
 python server.py
 ```
 *启动后，在浏览器访问 `http://localhost:8001` 即可打开可视化大屏。*
+
+> 可选环境变量：`PORT`（监听端口）、`LOG_SENTINEL_TOKEN`（启用写接口鉴权）、`ALERT_COOLDOWN_SECONDS`（告警冷却时长，默认 10）、`LOG_SENTINEL_DB_PATH`（数据库文件路径）。
 
 ### 3. 启动日志发生模拟器 (Generator)
 模拟业务系统向 `app.log` 持续输出日志（每秒 10 条）：
@@ -74,11 +79,13 @@ python generator.py --rate 10 --file app.log
 ```
 
 ### 4. 启动日志采集端 (Agent)
-Agent 将实时监听 `app.log` 文件，批量压缩合并日志并上报至服务端：
+Agent 将实时监听 `app.log` 文件（从文件末尾开始尾随），批量合并日志并上报至服务端：
 ```bash
 python agent.py --file app.log --server http://localhost:8001 --source my-mac-app
 ```
 *此时，回到网页控制台即可看到源源不断的实时日志和吞吐折线图！*
+
+> 若服务端启用了 `LOG_SENTINEL_TOKEN` 鉴权，Agent 需追加 `--token <令牌>`（或同样设置该环境变量）。
 
 ---
 
@@ -94,5 +101,25 @@ python agent.py --file app.log --server http://localhost:8001 --source my-mac-ap
 
 ### 验证 2：滑动窗口告警判定与收敛 (Alert Suppression)
 1. 默认情况下，数据库中自带了告警规则：“High Error Rate (ERROR >= 5 in 10s)”——10秒内出现超过5次 ERROR 日志即报警。
-2. 运行模拟器 `generator.py`，因为 ERROR 日志占比约 5%，随着时间推移，当 10 秒内误差数量满足条件时，网页看板会**立刻闪烁红光，并弹出红色的告警卡片**。
-3. 若您需要测试真实的飞书/钉钉推送，可在运行 `server.py` 时传入环境变量 `ALERT_WEBHOOK_URL`，即可在群聊中收到实时推送！
+2. 运行模拟器 `generator.py`，因为 ERROR 日志占比约 5%，随着时间推移，当 10 秒内误差数量满足条件时，网页看板会**立刻闪烁红光，并弹出红色的告警卡片**；条件恢复后告警卡片自动变绿进入“已恢复”状态。
+3. 告警恢复后若立刻再次满足触发条件，会被 **Cooldown 冷却机制**抑制，不会重复推送。
+4. 若您需要测试真实的飞书/钉钉推送，在网页看板下方的“实时告警通道路由”中填入群机器人 Webhook 地址并保存即可（或调用 `POST /api/settings/webhook`），告警触发与恢复都会同步推送到群聊。
+
+---
+
+## 🔐 可选鉴权
+
+默认所有接口开放（本地演示模式）。启动服务端前设置环境变量 `LOG_SENTINEL_TOKEN=<自定义密钥>`，所有**写接口**（日志上报、规则增删、Webhook 配置、告警处理）即要求请求头 `X-API-Token: <密钥>`；只读查询接口与 WebSocket 看板保持开放，看板功能不受影响：
+
+- **Agent**：追加 `--token <密钥>` 参数（或同样设置 `LOG_SENTINEL_TOKEN` 环境变量）；
+- **看板**：在“访问令牌 (服务端安全设置)”卡片中填入密钥，令牌保存在浏览器 localStorage 并自动随写请求携带。
+
+---
+
+## ✅ 回归测试
+
+```bash
+python scripts/verify_core_fixes.py
+```
+
+脚本会以临时数据库和随机端口启动真实 `server.py`，覆盖 20 项断言：可选 Token 鉴权（401/放行）、告警触发与自动恢复、冷却期抑制与冷却解除、离线告警按节点精确隔离（`source` 结构化匹配，杜绝文本 LIKE 误匹配）、历史日志查询，全部通过后自动清理。
