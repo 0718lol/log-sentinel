@@ -28,6 +28,11 @@ def init_db():
     )
     """)
 
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(logs)")}
+    if "event_id" not in columns:
+        cursor.execute("ALTER TABLE logs ADD COLUMN event_id TEXT")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_logs_event_id ON logs(event_id)")
+
     # Create rules table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS rules (
@@ -107,13 +112,21 @@ def save_logs(log_entries):
     log_entries: list of dicts with keys: timestamp, level, message, source
     """
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.executemany("""
-    INSERT INTO logs (timestamp, level, message, source)
-    VALUES (:timestamp, :level, :message, :source)
-    """, log_entries)
-    conn.commit()
-    conn.close()
+    inserted = []
+    try:
+        with conn:
+            for entry in log_entries:
+                cursor = conn.execute("""
+                    INSERT INTO logs (timestamp, level, message, source, event_id)
+                    VALUES (:timestamp, :level, :message, :source, :event_id)
+                    ON CONFLICT(event_id) DO NOTHING
+                """, dict(entry, event_id=entry.get("event_id")))
+                if cursor.rowcount:
+                    inserted.append(entry)
+        return inserted
+    finally:
+        conn.close()
+
 
 def get_recent_logs(limit=200):
     """Fetch recent logs from database."""

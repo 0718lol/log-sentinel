@@ -4,6 +4,8 @@ import sys
 import time
 import argparse
 import random
+import hashlib
+from spool import Spool
 from datetime import datetime, timezone
 import httpx
 import psutil
@@ -24,7 +26,7 @@ def detect_level(message: str) -> str:
         return "INFO"
 
 class LogAgent:
-    def __init__(self, filepath: str, server_url: str, source: str, batch_size: int, batch_interval: float, token: str = ""):
+    def __init__(self, filepath: str, server_url: str, source: str, batch_size: int, batch_interval: float, token: str = "", state_path: str = None, spool_limit: int = 10000):
         self.filepath = os.path.abspath(filepath)
         self.ingest_url = f"{server_url.rstrip('/')}/api/logs/ingest"
         self.source = source
@@ -34,18 +36,17 @@ class LogAgent:
         # Sent with every request when the server enables LOG_SENTINEL_TOKEN auth
         self.headers = {"X-API-Token": token} if token else {}
 
-        self.queue = None
+        state_path = state_path or os.path.join(".agent-state", hashlib.sha256(
+            (self.filepath + "\0" + source).encode()).hexdigest() + ".db")
+        self.spool = Spool(state_path, spool_limit)
         self.client = httpx.AsyncClient(trust_env=False)
         self.running = False
 
     async def start(self):
         self.running = True
-        # Bounded Queue - core of backpressure. Stops tailing when full (1000 items limit).
-        # Created inside start() to bind to the active asyncio event loop.
-        self.queue = asyncio.Queue(maxsize=1000)
         print(f"[*] Starting Log Agent. Monitoring: {self.filepath}")
         print(f"[*] Target Log Server: {self.ingest_url}")
-        print(f"[*] Bounded Queue size limit: 1000 lines (Backpressure enabled)")
+        print(f"[*] Durable outbox limit: {self.spool.limit} events (backpressure enabled)")
 
         # Create tasks
         self.tailer_task = asyncio.create_task(self.tail_file())
@@ -57,103 +58,107 @@ class LogAgent:
         except asyncio.CancelledError:
             pass
         finally:
+            self.running = False
+            for task in (self.tailer_task, self.batcher_task, self.stats_task):
+                task.cancel()
+            await asyncio.gather(self.tailer_task, self.batcher_task, self.stats_task, return_exceptions=True)
             await self.client.aclose()
+            self.spool.close()
             print("[*] Log Agent stopped.")
 
     async def tail_file(self):
-        """Tails the target file asynchronously, pushing lines to the bounded queue."""
-        last_ino = None
-        file_handle = None
-
-        while self.running:
-            try:
-                if not os.path.exists(self.filepath):
-                    # Wait for file to be created
-                    if file_handle:
-                        file_handle.close()
-                        file_handle = None
-                    await asyncio.sleep(1.0)
+        """Resume byte offsets, drain renamed files, and persist complete lines only."""
+        handle = None
+        identity = None
+        anchor = b""
+        try:
+            while self.running:
+                if handle is None:
+                    checkpoint = self.spool.checkpoint(self.filepath)
+                    candidates = [self.filepath]
+                    # Recover an unread renamed file in the same directory after restart.
+                    if checkpoint:
+                        candidates += [os.path.join(os.path.dirname(self.filepath), name)
+                                       for name in sorted(os.listdir(os.path.dirname(self.filepath)))]
+                    chosen = None
+                    for candidate in candidates:
+                        try:
+                            st = os.stat(candidate)
+                            candidate_id = f"{st.st_dev}:{st.st_ino}"
+                            if checkpoint and candidate_id == checkpoint[0]:
+                                chosen = candidate
+                                break
+                        except FileNotFoundError:
+                            continue
+                    if chosen is None:
+                        chosen = self.filepath
+                    try:
+                        handle = open(chosen, "rb")
+                    except FileNotFoundError:
+                        await asyncio.sleep(0.1)
+                        continue
+                    st = os.fstat(handle.fileno())
+                    identity = f"{st.st_dev}:{st.st_ino}"
+                    offset = checkpoint[1] if checkpoint and checkpoint[0] == identity else 0
+                    anchor = checkpoint[2] if offset else b""
+                    handle.seek(max(0, offset - len(anchor)))
+                    if st.st_size < offset or handle.read(len(anchor)) != anchor:
+                        offset, anchor = 0, b""
+                    handle.seek(offset)
+                offset = handle.tell()
+                # Detect copytruncate even if the replacement has already grown.
+                handle.seek(max(0, offset - len(anchor)))
+                changed = handle.read(len(anchor)) != anchor
+                handle.seek(offset)
+                if os.fstat(handle.fileno()).st_size < offset or changed:
+                    handle.seek(0)
+                    anchor = b""
+                    offset = 0
+                line = handle.readline()
+                if line.endswith(b"\n"):
+                    end = handle.tell()
+                    handle.seek(max(0, end - 128))
+                    next_anchor = handle.read(end - max(0, end - 128))
+                    handle.seek(end)
+                    message = line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+                    payload = {"timestamp": utc_now_iso(), "level": detect_level(message),
+                               "message": message, "source": self.source}
+                    if self.spool.append(payload, (self.filepath, identity, end, next_anchor)):
+                        anchor = next_anchor
+                    else:
+                        handle.seek(offset)
+                        await asyncio.sleep(0.1)
                     continue
-
-                stat = os.stat(self.filepath)
-                # Check for file rotation (inode change or size shrink)
-                if last_ino != stat.st_ino or (file_handle and os.path.getsize(self.filepath) < file_handle.tell()):
-                    print(f"[*] Log file rotated or recreated: {self.filepath}")
-                    if file_handle:
-                        file_handle.close()
-                    file_handle = open(self.filepath, "r", encoding="utf-8")
-                    last_ino = stat.st_ino
-                    # If it's a new file, start from start. If not, seek to end
-                    # Let's seek to end to avoid double-processing massive files, but start at beginning if empty
-                    file_handle.seek(0, os.SEEK_END)
-
-                if not file_handle:
-                    file_handle = open(self.filepath, "r", encoding="utf-8")
-                    last_ino = stat.st_ino
-                    file_handle.seek(0, os.SEEK_END)
-
-                # Read new lines
-                line = file_handle.readline()
-                if not line:
-                    # No new content, wait a bit
-                    await asyncio.sleep(0.1)
-                    continue
-
-                line_stripped = line.strip()
-                if line_stripped:
-                    # Put line in the bounded queue. If queue is full, this will yield control and block (Backpressure!)
-                    # It will only resume when the batcher successfully sends batches to the server.
-                    await self.queue.put(line_stripped)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[!] Error in file tailer: {e}", file=sys.stderr)
-                await asyncio.sleep(2.0)
-
-        if file_handle:
-            file_handle.close()
+                handle.seek(offset)
+                try:
+                    st = os.stat(self.filepath)
+                    rotated = f"{st.st_dev}:{st.st_ino}" != identity
+                except FileNotFoundError:
+                    rotated = False
+                if rotated:
+                    if line:
+                        raise RuntimeError("Rotated file ends in an incomplete line; preserve it and repair before resuming")
+                    handle.close()
+                    handle = None
+                    # Retire the drained file so restart recovery selects the new file.
+                    with self.spool.db:
+                        self.spool.db.execute('DELETE FROM checkpoints WHERE path=?', (self.filepath,))
+                await asyncio.sleep(0.1)
+        finally:
+            if handle:
+                handle.close()
 
     async def batch_and_send(self):
-        """Gathers logs from the queue and sends them in batches with Exponential Backoff."""
-        batch = []
-        last_send_time = time.time()
-
         while self.running:
-            try:
-                # Wait for an item from the queue
-                try:
-                    timeout = max(0.01, self.batch_interval - (time.time() - last_send_time))
-                    item = await asyncio.wait_for(self.queue.get(), timeout=timeout)
-                    batch.append(item)
-                    self.queue.task_done()
-                except asyncio.TimeoutError:
-                    # Trigger send on interval timeout
-                    pass
-
-                # If batch size reached or timeout exceeded, send the batch
-                if batch and (len(batch) >= self.batch_size or (time.time() - last_send_time) >= self.batch_interval):
-                    await self.send_batch_with_retry(batch)
-                    batch = []
-                    last_send_time = time.time()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[!] Error in batcher loop: {e}", file=sys.stderr)
-                await asyncio.sleep(1.0)
+            batch = self.spool.batch(self.batch_size)
+            if batch:
+                await self.send_batch_with_retry(batch)
+            else:
+                await asyncio.sleep(self.batch_interval)
 
     async def send_batch_with_retry(self, log_lines):
         """Sends a log batch to the server. Retries transient failures with exponential backoff."""
-        # Convert lines to ingest payloads
-        payload = []
-        for line in log_lines:
-            payload.append({
-                "timestamp": utc_now_iso(),
-                "level": detect_level(line),
-                "message": line,
-                "source": self.source
-            })
+        payload = log_lines
 
         attempt = 0
         base_delay = 1.0
@@ -163,15 +168,20 @@ class LogAgent:
             try:
                 response = await self.client.post(self.ingest_url, json=payload, timeout=5.0, headers=self.headers)
                 if response.status_code == 200:
+                    expected = {entry["event_id"] for entry in payload}
+                    try:
+                        acknowledged = set(response.json()["acknowledged_ids"])
+                    except (ValueError, KeyError, TypeError):
+                        raise RuntimeError("Server did not return durable event acknowledgements")
+                    if acknowledged != expected:
+                        raise RuntimeError("Server acknowledgement does not match submitted events")
+                    self.spool.acknowledge(acknowledged)
                     # Ingestion successful
                     if attempt > 0:
                         print(f"[*] Ingestion recovered after {attempt} retries.")
                     return
                 elif 400 <= response.status_code < 500 and response.status_code != 429:
-                    # Client errors are permanent for this batch (bad payload, auth, ...).
-                    # Retrying would never succeed and would stall the queue forever.
-                    print(f"[!] Server rejected batch with HTTP {response.status_code}. Dropping {len(log_lines)} log lines.", file=sys.stderr)
-                    return
+                    raise RuntimeError(f"HTTP {response.status_code}: batch retained in durable spool; fix configuration and restart")
                 elif response.status_code == 429:
                     # Server is rate limiting (Backpressure triggered by server)
                     print(f"[!] Server returned 429 Too Many Requests. Backing off...")
@@ -182,27 +192,24 @@ class LogAgent:
 
             # Calculate Exponential Backoff with Jitter (random variation)
             attempt += 1
-            delay = min(max_delay, base_delay * (2 ** attempt))
+            delay = min(max_delay, base_delay * (2 ** min(attempt, 10)))
             jitter = random.uniform(0.0, 0.5 * delay)
             sleep_time = delay + jitter
             
-            print(f"[i] Backoff Active. Queue fill: {self.queue.qsize()}/1000. Retrying in {sleep_time:.2f}s...")
+            print(f"[i] Backoff Active. Queue fill: {self.spool.pending_count()}/{self.spool.limit}. Retrying in {sleep_time:.2f}s...")
             await asyncio.sleep(sleep_time)
 
     async def report_agent_metrics(self):
-        """Periodically puts agent system resource metrics into the queue as a log entry."""
+        """Persist heartbeat events when outbox capacity is available."""
         while self.running:
             await asyncio.sleep(10.0)
             try:
                 cpu = psutil.cpu_percent(interval=None)
                 mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024 # MB
-                metric_log = f"[INFO] Agent heartbeat metrics: CPU {cpu:.1f}%, RAM {mem:.2f}MB, QueueSize {self.queue.qsize()}"
+                metric_log = f"[INFO] Agent heartbeat metrics: CPU {cpu:.1f}%, RAM {mem:.2f}MB, QueueSize {self.spool.pending_count()}"
                 
-                # Try putting in queue without blocking, skip if full to avoid blocking heartbeat
-                try:
-                    self.queue.put_nowait(metric_log)
-                except asyncio.QueueFull:
-                    pass
+                self.spool.append({"timestamp": utc_now_iso(), "level": "INFO",
+                                   "message": metric_log, "source": self.source})
             except Exception as e:
                 print(f"[!] Error gathering agent metrics: {e}", file=sys.stderr)
 
@@ -214,7 +221,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=50, help="Max batch size before sending")
     parser.add_argument("--batch-interval", type=float, default=0.5, help="Batch send timeout interval (seconds)")
     parser.add_argument("--token", default=os.environ.get("LOG_SENTINEL_TOKEN", ""), help="API token if the server enables auth (or set LOG_SENTINEL_TOKEN)")
+    parser.add_argument("--state", default=None, help="Durable state database; one process per database")
+    parser.add_argument("--spool-limit", type=int, default=10000)
     args = parser.parse_args()
+    if args.batch_size < 1 or args.batch_interval <= 0 or args.spool_limit < 1:
+        parser.error("batch-size, batch-interval and spool-limit must be positive")
 
     agent = LogAgent(
         filepath=args.file,
@@ -222,6 +233,8 @@ if __name__ == "__main__":
         source=args.source,
         batch_size=args.batch_size,
         batch_interval=args.batch_interval,
+        state_path=args.state,
+        spool_limit=args.spool_limit,
         token=args.token
     )
 

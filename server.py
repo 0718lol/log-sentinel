@@ -96,6 +96,7 @@ evaluation_lock = asyncio.Lock()
 
 # ----------------- Models -----------------
 class LogEntry(BaseModel):
+    event_id: Optional[str] = None
     timestamp: str # ISO-8601 string
     level: str
     message: str
@@ -307,7 +308,13 @@ async def ingest_logs(entries: List[LogEntry]):
     source = entries[0].source
     agent_last_seen[source] = now_epoch
 
-    for entry in entries:
+    db_entries = [{"timestamp": entry.timestamp, "level": entry.level,
+                   "message": entry.message, "source": entry.source,
+                   "event_id": entry.event_id} for entry in entries]
+    inserted = await asyncio.to_thread(database.save_logs, db_entries)
+
+    for log_dict in inserted:
+        entry = LogEntry(**log_dict)
         epoch = parse_iso_to_epoch(entry.timestamp)
         log_dict = {
             "timestamp": entry.timestamp,
@@ -315,7 +322,6 @@ async def ingest_logs(entries: List[LogEntry]):
             "message": entry.message,
             "source": entry.source
         }
-        db_entries.append(log_dict)
         ws_log_data.append(log_dict)
 
         # Parse metrics if it's an Agent heartbeat log
@@ -335,9 +341,6 @@ async def ingest_logs(entries: List[LogEntry]):
                 "message": entry.message,
                 "source": entry.source
             })
-
-    # Save to SQLite database (offloaded to a thread so the event loop never blocks on disk I/O)
-    await asyncio.to_thread(database.save_logs, db_entries)
 
     # Broadcast to Web UI via WebSockets
     await manager.broadcast({
@@ -370,7 +373,9 @@ async def ingest_logs(entries: List[LogEntry]):
     await clean_old_logs(now_epoch)
     await evaluate_rules(now_epoch)
 
-    return {"status": "ok", "count": len(entries)}
+    return {"status": "ok", "count": len(inserted),
+            "duplicates": len(entries) - len(inserted),
+            "acknowledged_ids": list(dict.fromkeys(e.event_id for e in entries if e.event_id))}
 
 @app.get("/api/logs")
 async def get_logs(limit: int = 100):
