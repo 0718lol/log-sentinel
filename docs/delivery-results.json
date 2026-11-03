@@ -1,0 +1,22 @@
+{
+  "expected_events": 1122,
+  "stored_events": 1122,
+  "missing_events": 0,
+  "duplicate_rows": 0,
+  "replay_duplicates_suppressed": 1,
+  "bulk_events": 1000,
+  "bulk_seconds": 0.21998187500000022,
+  "bulk_events_per_second": 4545.829059780489,
+  "latency_samples": 20,
+  "latency_p50_ms": 110.39285349999983,
+  "latency_p95_ms": 165.3575420000002,
+  "latency_poll_resolution_ms": 50,
+  "scenarios": [
+    "server unavailable",
+    "agent SIGKILL and restart",
+    "rename rotation",
+    "same-size truncate/regrow",
+    "post-commit replay"
+  ],
+  "scope": "Single local run; latency includes 50ms observation polling; throughput includes file collection and alert evaluation."
+}
