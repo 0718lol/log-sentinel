@@ -7,3 +7,5 @@ app.log
 *.egg-info/
 dist/
 build/
+
+.agent-state/
